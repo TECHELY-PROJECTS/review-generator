@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: reviewgen
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/models
+    envVars:
+      - key: NODE_VERSION
+        value: 20
