@@ -84,6 +84,9 @@ const STRUCTURAL_SEGMENTS = new Set([
   'compare', 'comparison', 'alternatives', 'pricing', 'features', 'demo',
   'profile', 'vendor', 'vendors', 'category', 'categories', 'directory',
   'sem-compare', 'sem', 'shortlist', 'integrations', 'about', 'company',
+  // form / action words (e.g. /products/new/<UUID>/ — review-submission pages)
+  'new', 'edit', 'submit', 'write', 'create', 'add', 'update', 'delete',
+  'form', 'feedback', 'rate', 'rating', 'quality', 'start', 'step', 'invite',
   // common locale / region prefixes
   'in', 'uk', 'us', 'ca', 'au', 'nz', 'ie', 'es', 'de', 'fr', 'it', 'pt',
   'br', 'mx', 'jp', 'kr', 'cn', 'tw', 'hk', 'sg', 'my', 'th', 'id', 'ph',
@@ -98,9 +101,19 @@ function isNumericId(seg) {
   return /^[0-9]+$/.test(seg) || /^[0-9]+[-_][0-9]+$/.test(seg);
 }
 
+function isUuid(seg) {
+  if (!seg) return false;
+  // Standard 8-4-4-4-12 UUID, with or without hyphens
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg) ||
+    /^[0-9a-f]{32}$/i.test(seg)
+  );
+}
+
 function isLikelyProductSlug(seg) {
   if (!seg) return false;
   if (isNumericId(seg)) return false;
+  if (isUuid(seg)) return false;
   const lc = seg.toLowerCase();
   if (STRUCTURAL_SEGMENTS.has(lc)) return false;
   // Slugs are usually 2+ chars and contain at least one letter
@@ -259,18 +272,81 @@ async function fetchViaJina(url) {
   return res.data;
 }
 
+/**
+ * Parse the "Consider covering these topics ..." chip line from Capterra
+ * review-submission pages (/products/new/<UUID>/). Jina flattens the chips
+ * into one space-separated line, so we tokenize and group greedily, allowing
+ * one extra TitleCase word per topic and the connector pattern
+ * "Cap <stop> Cap" (e.g. "Value for Money").
+ */
+function extractCapterraFormTopics(md) {
+  const m = md.match(/Consider covering[^:\n]*:\s*\n+\s*(.+?)(?:\n\s*\n|$)/);
+  if (!m) return [];
+  const line = m[1].replace(/[*_`]/g, '').trim();
+  const tokens = line.split(/\s+/);
+  const stop = new Set(['for', 'of', 'to', 'and', 'the', '&', 'a', 'an', 'in', 'on', 'with']);
+  const isCap = t => /^[A-Z][a-zA-Z&]*$/.test(t);
+  const topics = [];
+  let i = 0;
+  while (i < tokens.length) {
+    if (!isCap(tokens[i])) { i++; continue; }
+    const parts = [tokens[i]];
+    let j = i + 1;
+    // Connector pattern: Cap <stop> Cap  →  e.g. "Value for Money"
+    if (j + 1 < tokens.length && stop.has(tokens[j].toLowerCase()) && isCap(tokens[j + 1])) {
+      parts.push(tokens[j], tokens[j + 1]);
+      j += 2;
+    } else if (j < tokens.length && isCap(tokens[j])) {
+      // Adjacent Cap word — only attach if the word AFTER it isn't a stopword
+      // (a stopword would mean the next word starts a new "Cap stop Cap" topic)
+      const next2 = tokens[j + 1];
+      if (!next2 || !stop.has(next2.toLowerCase())) {
+        parts.push(tokens[j]);
+        j += 1;
+      }
+    }
+    topics.push(parts.join(' '));
+    i = j;
+  }
+  return topics.filter(t => t.length >= 3 && t.length <= 55);
+}
+
 function parseJinaMarkdown(md, platform, knownName) {
-  let productName = knownName || '';
+  // Always try to extract the name from the markdown — page content beats URL
+  // heuristics. Order: explicit "about <Name>?" form copy → first H1 → Title:
+  let scrapedName = '';
 
-  if (!productName) {
-    const titleLine = md.match(/^Title:\s*(.+)$/m);
-    if (titleLine) productName = cleanProductName(titleLine[1], platform);
-  }
-  if (!productName) {
+  // Capterra review form has lines like "Pros: What did you like most about Marketo Engage?"
+  // and "Describe your overall experience with Marketo Engage". Both are 100% reliable.
+  const aboutMatch =
+    md.match(/(?:like\s+(?:most|least|best)\s+about|experience\s+with|recommendations\s+to\s+others\s+considering)\s+([^?\n]{2,80}?)\s*[?\n]/i);
+  if (aboutMatch) scrapedName = cleanProductName(aboutMatch[1], platform);
+
+  if (!scrapedName) {
     const h1 = md.match(/^#\s+(.+)$/m);
-    if (h1) productName = cleanProductName(h1[1], platform);
+    if (h1) {
+      const candidate = cleanProductName(h1[1], platform);
+      if (candidate && !/^(write a review|reviews?|home|welcome)$/i.test(candidate)) {
+        scrapedName = candidate;
+      }
+    }
+  }
+  if (!scrapedName) {
+    const titleLine = md.match(/^Title:\s*(.+)$/m);
+    if (titleLine) {
+      const candidate = cleanProductName(titleLine[1], platform);
+      // Don't accept generic page titles like "Write a Review"
+      if (candidate && !/^(write a review|reviews?|home|welcome)$/i.test(candidate)) {
+        scrapedName = candidate;
+      }
+    }
   }
 
+  // Prefer the scraped name (canonical, from the page itself). Fall back to
+  // the URL-derived name only if scraping yielded nothing usable.
+  const productName = scrapedName || knownName || '';
+
+  // Keywords: bullet points first (most pages), then Capterra form chips.
   const keywords = [];
   const lines = md.split('\n');
   for (const ln of lines) {
@@ -289,6 +365,11 @@ function parseJinaMarkdown(md, platform, knownName) {
         keywords.push(v);
       }
     }
+  }
+
+  // Capterra form-page chips (no bullets — flat space-separated line)
+  if (keywords.length < 3) {
+    keywords.push(...extractCapterraFormTopics(md));
   }
 
   return { productName, keywords: dedupeKeywords(keywords).slice(0, 12) };
@@ -402,14 +483,23 @@ async function scrapeUrl(url, platform = 'capterra') {
   // Strategy 0: extract product name from URL — robust to all known shapes
   const urlName = extractNameFromUrl(url, norm);
 
+  // Track the best name scraped from page content across all strategies, so
+  // we don't lose it when one strategy yields a great name but few keywords.
+  // The scraped name is canonical; the URL name is heuristic and may be junk
+  // (e.g. "" for /products/new/<UUID>/ review-submission URLs).
+  let bestScrapedName = '';
+  const isDifferentFromUrl = n =>
+    n && (!urlName || n.toLowerCase() !== urlName.toLowerCase());
+
   // Strategy 1: Jina Reader (works for SoftwareReviews; blocked on Capterra/G2)
   try {
     const md = await fetchViaJina(url);
     if (md) {
       const { productName, keywords } = parseJinaMarkdown(md, norm, urlName);
+      if (isDifferentFromUrl(productName)) bestScrapedName = productName;
       if (keywords.length >= 3) {
         return {
-          productName: productName || urlName || '',
+          productName: bestScrapedName || productName || urlName || '',
           keywords,
           usedFallbackKeywords: false,
         };
@@ -424,9 +514,12 @@ async function scrapeUrl(url, platform = 'capterra') {
     const html = await fetchDirect(url);
     if (html) {
       const { productName, keywords } = parseHtml(html, norm, urlName);
+      if (!bestScrapedName && isDifferentFromUrl(productName)) {
+        bestScrapedName = productName;
+      }
       if (keywords.length >= 3) {
         return {
-          productName: productName || urlName || '',
+          productName: bestScrapedName || productName || urlName || '',
           keywords,
           usedFallbackKeywords: false,
         };
@@ -436,11 +529,11 @@ async function scrapeUrl(url, platform = 'capterra') {
     console.error('[scrape] direct fetch failed:', err.message);
   }
 
-  // Strategy 3: Guaranteed fallback — name from URL + platform-standard topics.
+  // Strategy 3: Guaranteed fallback — best name we have + platform-standard topics.
   // Caller should upgrade keywords via /api/generate-keywords.
   const defaultKeywords = PLATFORM_DEFAULT_KEYWORDS[norm] || PLATFORM_DEFAULT_KEYWORDS.capterra;
   return {
-    productName: urlName || '',
+    productName: bestScrapedName || urlName || '',
     keywords: defaultKeywords,
     usedFallbackKeywords: true,
   };
