@@ -71,15 +71,60 @@ function useCopy() {
   return { copiedKey, copy }
 }
 
+// ─── Provider config (mirrored from server) ──────────────────────────────────
+// Key/model are per-provider so switching back and forth keeps both intact.
+const PROVIDER_DEFAULTS = {
+  openrouter: { keyStorage: 'or_api_key',     modelStorage: 'or_model',     customStorage: 'or_custom_model',     defaultModel: 'anthropic/claude-opus-4', label: 'OpenRouter', keysUrl: 'https://openrouter.ai/keys',     keyPlaceholder: 'sk-or-v1-...' },
+  cometapi:   { keyStorage: 'cometapi_key',   modelStorage: 'cometapi_model', customStorage: 'cometapi_custom_model', defaultModel: 'gpt-4o',                  label: 'CometAPI',   keysUrl: 'https://www.cometapi.com/console/token', keyPlaceholder: 'sk-...' },
+}
+
+// ─── Topic-cache helpers (localStorage, provider-agnostic) ───────────────────
+// Same product on the same platform is always the same product — caching its
+// AI-generated topics means the AI is called ONCE per product, ever (per
+// browser). Clearing the cache forces a refresh.
+const KW_CACHE_KEY = 'kw_cache_v1'
+const readKwCache = () => {
+  try { return JSON.parse(localStorage.getItem(KW_CACHE_KEY) || '{}') } catch { return {} }
+}
+const writeKwCache = obj => { try { localStorage.setItem(KW_CACHE_KEY, JSON.stringify(obj)) } catch {} }
+const kwCacheKey = (platform, name) =>
+  `${(platform || 'capterra').toLowerCase()}::${(name || '').toLowerCase().trim()}`
+const getCachedKeywords = (platform, name) => {
+  if (!name) return null
+  const v = readKwCache()[kwCacheKey(platform, name)]
+  return Array.isArray(v) && v.length >= 3 ? v : null
+}
+const cacheKeywords = (platform, name, kws) => {
+  if (!name || !Array.isArray(kws) || kws.length < 3) return
+  const c = readKwCache()
+  c[kwCacheKey(platform, name)] = kws
+  writeKwCache(c)
+}
+const clearKwCache = () => { try { localStorage.removeItem(KW_CACHE_KEY) } catch {} }
+
 // ─── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  // Settings
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('or_api_key') || '')
-  const [model, setModel] = useState(() => localStorage.getItem('or_model') || 'anthropic/claude-opus-4')
-  const [customModel, setCustomModel] = useState(() => localStorage.getItem('or_custom_model') || '')
+  // Settings — provider + per-provider keys/models (so switching is non-destructive)
+  const [provider, setProvider] = useState(() => localStorage.getItem('llm_provider') || 'openrouter')
+  const [orKey, setOrKey]               = useState(() => localStorage.getItem('or_api_key') || '')
+  const [cometKey, setCometKey]         = useState(() => localStorage.getItem('cometapi_key') || '')
+  const [orModel, setOrModel]           = useState(() => localStorage.getItem('or_model') || PROVIDER_DEFAULTS.openrouter.defaultModel)
+  const [cometModel, setCometModel]     = useState(() => localStorage.getItem('cometapi_model') || PROVIDER_DEFAULTS.cometapi.defaultModel)
+  const [orCustomModel, setOrCustomModel]       = useState(() => localStorage.getItem('or_custom_model') || '')
+  const [cometCustomModel, setCometCustomModel] = useState(() => localStorage.getItem('cometapi_custom_model') || '')
   const customModelDebounceRef = useRef(null)
   const [models, setModels] = useState([])
   const [showSettings, setShowSettings] = useState(false)
+  const [cacheCleared, setCacheCleared] = useState(false)
+
+  // Active values for the currently-selected provider — the rest of the app reads these.
+  const apiKey      = provider === 'cometapi' ? cometKey      : orKey
+  const setApiKey   = provider === 'cometapi' ? setCometKey   : setOrKey
+  const model       = provider === 'cometapi' ? cometModel    : orModel
+  const setModel    = provider === 'cometapi' ? setCometModel : setOrModel
+  const customModel = provider === 'cometapi' ? cometCustomModel    : orCustomModel
+  const setCustomModelState = provider === 'cometapi' ? setCometCustomModel : setOrCustomModel
+  const providerCfg = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.openrouter
 
   // Profile input
   const [inputMode, setInputMode] = useState('paste')
@@ -99,36 +144,42 @@ export default function App() {
 
   const { copiedKey, copy } = useCopy()
 
-  // Load models
+  // Load models for current provider (refetched when user switches provider).
   useEffect(() => {
-    axios.get(`${API}/api/models`).then(r => setModels(r.data)).catch(() => {})
-  }, [])
+    axios.get(`${API}/api/models?provider=${provider}`).then(r => setModels(r.data)).catch(() => setModels([]))
+  }, [provider])
 
-  // Persist settings
-  useEffect(() => {
-    if (apiKey) localStorage.setItem('or_api_key', apiKey)
-  }, [apiKey])
-  useEffect(() => {
-    if (model) localStorage.setItem('or_model', model)
-  }, [model])
+  // Persist settings — each provider's values are kept independently.
+  useEffect(() => { localStorage.setItem('llm_provider', provider) }, [provider])
+  useEffect(() => { if (orKey)     localStorage.setItem('or_api_key', orKey) },         [orKey])
+  useEffect(() => { if (cometKey)  localStorage.setItem('cometapi_key', cometKey) },    [cometKey])
+  useEffect(() => { if (orModel)    localStorage.setItem('or_model', orModel) },        [orModel])
+  useEffect(() => { if (cometModel) localStorage.setItem('cometapi_model', cometModel) }, [cometModel])
 
-  // Auto-save custom model with 500ms debounce — no Save button needed
+  // Auto-save custom model with 500ms debounce — writes to the active provider's key.
   const handleCustomModelChange = (val) => {
-    setCustomModel(val)
+    setCustomModelState(val)
     if (customModelDebounceRef.current) clearTimeout(customModelDebounceRef.current)
+    const storageKey = providerCfg.customStorage
     customModelDebounceRef.current = setTimeout(() => {
       const trimmed = val.trim()
-      if (trimmed) localStorage.setItem('or_custom_model', trimmed)
+      if (trimmed) localStorage.setItem(storageKey, trimmed)
     }, 500)
   }
 
   const handleCustomModelBlur = () => {
     if (customModelDebounceRef.current) clearTimeout(customModelDebounceRef.current)
     const trimmed = customModel.trim()
-    if (trimmed) localStorage.setItem('or_custom_model', trimmed)
+    if (trimmed) localStorage.setItem(providerCfg.customStorage, trimmed)
   }
 
   const activeModel = model === '__custom__' ? customModel.trim() : model
+
+  const handleClearCache = () => {
+    clearKwCache()
+    setCacheCleared(true)
+    setTimeout(() => setCacheCleared(false), 1800)
+  }
 
   // ── Profile parse ──────────────────────────────────────────────────────────
   const handleParseLine = async () => {
@@ -167,19 +218,33 @@ export default function App() {
   const removeProductRow = id =>
     setProducts(prev => prev.length > 1 ? prev.filter(p => p.id !== id) : prev)
 
-  // Upgrade generic platform fallback keywords into product-specific topics
-  // using the user's own OpenRouter key. No-op if we don't have a key/model.
+  // Upgrade generic platform fallback keywords into product-specific topics.
+  // Order:
+  //   1. Try the local cache — same product = same topics, zero API cost.
+  //   2. If miss, call the user's selected provider (OpenRouter or CometAPI),
+  //      then cache the result so next time is free.
+  // No-op if we have neither cache nor key/model.
   const upgradeKeywordsWithAI = async (id, productName, platform) => {
-    if (!apiKey || !activeModel || !productName) return
-    updateProduct(id, { keywordsUpgrading: true })
+    if (!productName) return
+
+    const cached = getCachedKeywords(platform, productName)
+    if (cached) {
+      updateProduct(id, { keywords: cached, keywordsUpgrading: false, keywordsFromCache: true })
+      return
+    }
+
+    if (!apiKey || !activeModel) return
+    updateProduct(id, { keywordsUpgrading: true, keywordsFromCache: false })
     try {
       const r = await axios.post(`${API}/api/generate-keywords`, {
         apiKey,
         model: activeModel,
         productName,
         platform,
+        provider,
       })
       if (Array.isArray(r.data?.keywords) && r.data.keywords.length >= 3) {
+        cacheKeywords(platform, productName, r.data.keywords)
         updateProduct(id, { keywords: r.data.keywords, keywordsUpgrading: false })
         return
       }
@@ -249,7 +314,7 @@ export default function App() {
 
   // ── Generate all ──────────────────────────────────────────────────────────
   const handleGenerate = async () => {
-    if (!apiKey) { setGenError('Enter your OpenRouter API key in Settings'); return }
+    if (!apiKey) { setGenError(`Enter your ${providerCfg.label} API key in Settings`); return }
     if (!activeModel) { setGenError('Enter a model ID in Settings'); return }
     if (!activeProfile) { setGenError('Select or parse a profile first'); return }
 
@@ -284,6 +349,7 @@ export default function App() {
         model: activeModel,
         profile: activeProfile,
         products: resolved,
+        provider,
       })
       setBatchResults(r.data)
     } catch (err) {
@@ -329,7 +395,7 @@ export default function App() {
             <span>ReviewGen</span>
           </div>
           <div className="header-right">
-            {apiKey && <span className="api-badge"><span className="dot green" /> API Connected</span>}
+            {apiKey && <span className="api-badge"><span className="dot green" /> {providerCfg.label} Connected</span>}
             <button className="btn-ghost" onClick={() => setShowSettings(!showSettings)}>⚙ Settings</button>
           </div>
         </div>
@@ -340,15 +406,34 @@ export default function App() {
         <div className="settings-panel">
           <div className="settings-inner">
             <h3>Settings</h3>
+
+            {/* Provider toggle */}
+            <div className="field-group" style={{ marginBottom: 16 }}>
+              <label>AI Provider</label>
+              <div className="tab-toggle" style={{ display: 'inline-flex' }}>
+                <button
+                  type="button"
+                  className={provider === 'openrouter' ? 'tab active' : 'tab'}
+                  onClick={() => setProvider('openrouter')}
+                >OpenRouter</button>
+                <button
+                  type="button"
+                  className={provider === 'cometapi' ? 'tab active' : 'tab'}
+                  onClick={() => setProvider('cometapi')}
+                >CometAPI</button>
+              </div>
+              <span className="hint">Switch between providers anytime — both API keys are kept saved.</span>
+            </div>
+
             <div className="settings-row">
               <div className="field-group">
-                <label>OpenRouter API Key</label>
+                <label>{providerCfg.label} API Key</label>
                 <input
                   type="password" className="input mono"
-                  placeholder="sk-or-v1-..."
+                  placeholder={providerCfg.keyPlaceholder}
                   value={apiKey} onChange={e => setApiKey(e.target.value)}
                 />
-                <span className="hint">Get yours at <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer">openrouter.ai/keys</a></span>
+                <span className="hint">Get yours at <a href={providerCfg.keysUrl} target="_blank" rel="noreferrer">{providerCfg.keysUrl.replace(/^https?:\/\//, '')}</a></span>
               </div>
               <div className="field-group">
                 <label>AI Model</label>
@@ -363,13 +448,26 @@ export default function App() {
                 {model === '__custom__' && (
                   <input
                     className="input mono"
-                    placeholder="e.g. google/gemini-2.5-flash or anthropic/claude-haiku-4"
+                    placeholder={provider === 'cometapi' ? 'e.g. gpt-4o-mini, deepseek-v3.1, gemini-2.5-flash' : 'e.g. google/gemini-2.5-flash or anthropic/claude-haiku-4'}
                     value={customModel}
                     onChange={e => handleCustomModelChange(e.target.value)}
                     onBlur={handleCustomModelBlur}
                   />
                 )}
-                <span className="hint">Claude 3.5 Sonnet is the default. Custom accepts any OpenRouter model ID — auto-saved on blur.</span>
+                <span className="hint">Custom accepts any {providerCfg.label} model ID — auto-saved on blur.</span>
+              </div>
+            </div>
+
+            {/* Topic cache controls */}
+            <div className="field-group" style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #2a2a2a' }}>
+              <label>Topic cache</label>
+              <span className="hint">
+                Each product's AI-generated topics are cached locally so the same product never burns credits twice. Switching providers also reuses the cache.
+              </span>
+              <div style={{ marginTop: 8 }}>
+                <button type="button" className="btn-secondary sm" onClick={handleClearCache}>
+                  {cacheCleared ? 'Cleared ✓' : 'Clear topic cache'}
+                </button>
               </div>
             </div>
           </div>

@@ -6,7 +6,13 @@ const path = require('path');
 
 const { scrapeUrl } = require('./scraper');
 const { buildReviewPrompt } = require('./prompt');
-const { generateReview, generateProductKeywords, RECOMMENDED_MODELS } = require('./openrouter');
+const {
+  generateReview,
+  generateProductKeywords,
+  RECOMMENDED_MODELS,
+  RECOMMENDED_MODELS_FLAT,
+  PROVIDERS,
+} = require('./openrouter');
 const { parseXlsx, parsePastedLine } = require('./xlsxParser');
 
 const app = express();
@@ -19,12 +25,22 @@ const clientDist = path.join(__dirname, '../client/dist');
 app.use(express.static(clientDist));
 
 // ── Models ────────────────────────────────────────────────────────────────────
-app.get('/api/models', (_req, res) => res.json(RECOMMENDED_MODELS));
+// GET /api/models           → flat list (back-compat: OpenRouter recommendations)
+// GET /api/models?provider=openrouter | cometapi → that provider's list
+// GET /api/providers        → metadata for the client provider dropdown
+app.get('/api/models', (req, res) => {
+  const p = (req.query.provider || '').toString().toLowerCase();
+  if (p && RECOMMENDED_MODELS[p]) return res.json(RECOMMENDED_MODELS[p]);
+  res.json(RECOMMENDED_MODELS_FLAT);
+});
+
+app.get('/api/providers', (_req, res) => {
+  res.json(
+    Object.entries(PROVIDERS).map(([id, cfg]) => ({ id, label: cfg.label })),
+  );
+});
 
 // ── Scrape (platform-aware) ───────────────────────────────────────────────────
-// Returns { productName, keywords, usedFallbackKeywords } where
-// `usedFallbackKeywords: true` signals the client to upgrade keywords via
-// /api/generate-keywords (which calls the user's own LLM).
 app.post('/api/scrape', async (req, res) => {
   const { url, platform = 'capterra' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
@@ -37,10 +53,9 @@ app.post('/api/scrape', async (req, res) => {
   }
 });
 
-// ── Batch scrape: scrape multiple URLs concurrently ───────────────────────────
+// ── Batch scrape ──────────────────────────────────────────────────────────────
 app.post('/api/scrape-batch', async (req, res) => {
   const { items, platform = 'capterra' } = req.body;
-  // items: [{ url, index }]
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items[] required' });
 
   const results = await Promise.allSettled(
@@ -69,16 +84,16 @@ app.post('/api/scrape-batch', async (req, res) => {
 });
 
 // ── AI-generated, product-specific keywords ──────────────────────────────────
-// Called by the client when /api/scrape returns usedFallbackKeywords: true.
-// Uses the user's own OpenRouter key — never stored on the server.
+// Body: { apiKey, model, productName, platform?, provider? }
+// `provider` is "openrouter" (default) or "cometapi".
 app.post('/api/generate-keywords', async (req, res) => {
-  const { apiKey, model, productName, platform = 'capterra' } = req.body;
-  if (!apiKey) return res.status(400).json({ error: 'OpenRouter API key required' });
+  const { apiKey, model, productName, platform = 'capterra', provider = 'openrouter' } = req.body;
+  if (!apiKey) return res.status(400).json({ error: 'API key required' });
   if (!model) return res.status(400).json({ error: 'Model required' });
   if (!productName) return res.status(400).json({ error: 'Product name required' });
 
   try {
-    const keywords = await generateProductKeywords(apiKey, model, productName, platform);
+    const keywords = await generateProductKeywords(apiKey, model, productName, platform, provider);
     res.json({ keywords });
   } catch (err) {
     console.error('Keyword AI error:', err.message);
@@ -111,15 +126,15 @@ app.post('/api/parse-line', (req, res) => {
 
 // ── Generate single review ────────────────────────────────────────────────────
 app.post('/api/generate', async (req, res) => {
-  const { apiKey, model, profile, productName, keywords, platform = 'capterra' } = req.body;
-  if (!apiKey) return res.status(400).json({ error: 'OpenRouter API key required' });
+  const { apiKey, model, profile, productName, keywords, platform = 'capterra', provider = 'openrouter' } = req.body;
+  if (!apiKey) return res.status(400).json({ error: 'API key required' });
   if (!model) return res.status(400).json({ error: 'Model required' });
   if (!profile) return res.status(400).json({ error: 'Profile required' });
   if (!productName) return res.status(400).json({ error: 'Product name required' });
 
   try {
     const prompt = buildReviewPrompt(profile, productName, keywords || [], platform);
-    const review = await generateReview(apiKey, model, prompt);
+    const review = await generateReview(apiKey, model, prompt, provider);
     res.json({ review });
   } catch (err) {
     console.error('Generate error:', err.message);
@@ -127,11 +142,10 @@ app.post('/api/generate', async (req, res) => {
   }
 });
 
-// ── Batch generate: iterate product rows concurrently ────────────────────────
-// Each item: { productName, keywords, platform }
+// ── Batch generate ────────────────────────────────────────────────────────────
 app.post('/api/generate-batch', async (req, res) => {
-  const { apiKey, model, profile, products } = req.body;
-  if (!apiKey) return res.status(400).json({ error: 'OpenRouter API key required' });
+  const { apiKey, model, profile, products, provider = 'openrouter' } = req.body;
+  if (!apiKey) return res.status(400).json({ error: 'API key required' });
   if (!model) return res.status(400).json({ error: 'Model required' });
   if (!profile) return res.status(400).json({ error: 'Profile required' });
   if (!Array.isArray(products) || !products.length) return res.status(400).json({ error: 'products[] required' });
@@ -139,7 +153,7 @@ app.post('/api/generate-batch', async (req, res) => {
   const results = await Promise.allSettled(
     products.map(async (p, i) => {
       const prompt = buildReviewPrompt(profile, p.productName, p.keywords || [], p.platform || 'capterra');
-      const review = await generateReview(apiKey, model, prompt);
+      const review = await generateReview(apiKey, model, prompt, provider);
       return { index: i, productName: p.productName, platform: p.platform || 'capterra', review };
     }),
   );
