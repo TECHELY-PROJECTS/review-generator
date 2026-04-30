@@ -6,31 +6,40 @@ const API = ''
 
 // ─── Platform config ───────────────────────────────────────────────────────────
 const PLATFORMS = [
-  { id: 'capterra', label: 'Capterra' },
-  { id: 'g2', label: 'G2' },
-  { id: 'softwarereviews', label: 'Software Reviews' },
+  { id: 'capterra',         label: 'Capterra' },
+  { id: 'g2',               label: 'G2 (Software)' },
+  { id: 'g2service',        label: 'G2 (Service)' },
+  { id: 'softwarereviews',  label: 'Software Reviews' },
 ]
 
 const PLATFORM_SECTIONS = {
   capterra: [
-    { key: 'title', label: 'Title', color: 'accent' },
-    { key: 'pros', label: 'Pros', color: 'green' },
-    { key: 'cons', label: 'Cons', color: 'red' },
+    { key: 'title',   label: 'Title',   color: 'accent' },
+    { key: 'pros',    label: 'Pros',    color: 'green' },
+    { key: 'cons',    label: 'Cons',    color: 'red' },
     { key: 'overall', label: 'Overall', color: 'purple' },
   ],
   g2: [
-    { key: 'title', label: 'Title', color: 'accent' },
-    { key: 'pros', label: 'Pros', color: 'green' },
-    { key: 'cons', label: 'Cons', color: 'red' },
+    { key: 'title',           label: 'Title',                              color: 'accent' },
+    { key: 'pros',            label: 'What You Like Best',                 color: 'green' },
+    { key: 'cons',            label: 'What You Dislike',                   color: 'red' },
     { key: 'problemsSolving', label: "Problems It's Solving & Benefiting", color: 'teal' },
   ],
+  // NEW: G2 (Service) — agencies/consultancies/providers
+  g2service: [
+    { key: 'title',           label: 'Title',                              color: 'accent' },
+    { key: 'problemsSolving', label: 'Problems Solving & Benefits',        color: 'teal' },
+    { key: 'whatYouLikeBest', label: 'What You Like Best',                 color: 'green' },
+    { key: 'dislikes',        label: 'What You Dislike',                   color: 'red' },
+    { key: 'recommendations', label: 'Recommendations to Others',          color: 'purple' },
+  ],
   softwarereviews: [
-    { key: 'title', label: 'Title', color: 'accent' },
-    { key: 'pros', label: 'Pros', color: 'green' },
-    { key: 'cons', label: 'Cons', color: 'red' },
-    { key: 'additionalFeature', label: "Additional Feature I'd Like to See", color: 'yellow' },
-    { key: 'whatMakesDifferent', label: 'What Makes It Different', color: 'teal' },
-    { key: 'suggestion', label: 'Suggestion', color: 'muted' },
+    { key: 'title',              label: 'Title',                              color: 'accent' },
+    { key: 'pros',               label: 'Pros',                               color: 'green' },
+    { key: 'cons',               label: 'Cons',                               color: 'red' },
+    { key: 'additionalFeature',  label: "Additional Feature I'd Like to See", color: 'yellow' },
+    { key: 'whatMakesDifferent', label: 'What Makes It Different',            color: 'teal' },
+    { key: 'suggestion',         label: 'Suggestion',                         color: 'muted' },
   ],
 }
 

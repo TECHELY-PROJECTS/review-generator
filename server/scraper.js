@@ -45,6 +45,20 @@ const PLATFORM_DEFAULT_KEYWORDS = {
     'Return on Investment',
     'Integration Options',
   ],
+  // G2 SERVICE reviews are about agencies/consultancies/providers — not software.
+  // Topics reflect what real users discuss when reviewing service engagements.
+  g2service: [
+    'Quality of Service',
+    'Communication',
+    'Project Management',
+    'Responsiveness',
+    'Expertise & Knowledge',
+    'Meeting Deadlines',
+    'Value for Money',
+    'Strategic Insight',
+    'Onboarding Experience',
+    'Long-term Partnership',
+  ],
   softwarereviews: [
     'Enables Productivity',
     'Reliable',
@@ -66,6 +80,7 @@ const PLATFORM_DEFAULT_KEYWORDS = {
 const STRUCTURAL_SEGMENTS = new Set([
   // platform routing words
   'p', 'software', 'reviews', 'review', 'products', 'product', 'app', 'apps',
+  'services', 'service', 'agencies', 'agency', 'providers', 'provider',
   'compare', 'comparison', 'alternatives', 'pricing', 'features', 'demo',
   'profile', 'vendor', 'vendors', 'category', 'categories', 'directory',
   'sem-compare', 'sem', 'shortlist', 'integrations', 'about', 'company',
@@ -120,7 +135,11 @@ function slugToTitle(slug) {
 
 // Anchor keywords: when present in the URL, the product slug comes AFTER them.
 // e.g. /sem-compare/it-management/p/100299/QuickBooks-Online → product is after "p"
-const ANCHOR_KEYWORDS = new Set(['p', 'software', 'reviews', 'review', 'products', 'product']);
+const ANCHOR_KEYWORDS = new Set([
+  'p', 'software', 'reviews', 'review', 'products', 'product',
+  // G2 services / agency directories — same parsing pattern, different vertical
+  'services', 'service', 'agencies', 'agency', 'providers', 'provider',
+]);
 
 /**
  * Extract the product name from the URL.
@@ -187,7 +206,7 @@ function cleanProductName(raw, platform) {
     .trim();
 
   // Strip platform name if accidentally appended
-  if (platform === 'g2') name = name.replace(/\s*\|?\s*G2\s*$/i, '').trim();
+  if (platform === 'g2' || platform === 'g2service') name = name.replace(/\s*\|?\s*G2\s*$/i, '').trim();
   if (platform === 'capterra') name = name.replace(/\s*\|?\s*Capterra\s*$/i, '').trim();
   if (platform === 'softwarereviews' || platform === 'software_reviews') {
     name = name.replace(/\s*\|?\s*SoftwareReviews\s*$/i, '').trim();
@@ -348,7 +367,7 @@ function parseHtml(html, platform, knownName) {
   const sels =
     platform === 'capterra'
       ? ['span.sb.badge span', 'span[class*="badge"] span', 'span[class*="rx-text-xs"]']
-      : platform === 'g2'
+      : (platform === 'g2' || platform === 'g2service')
       ? [
           'div.elv-flex.elv-items-center.elv-gap-2 span.elv-text-sm.elv-text-subtle',
           'span.elv-text-subtle',
@@ -431,6 +450,7 @@ module.exports = {
   scrapeUrl,
   scrapeCapterraUrl: url => scrapeUrl(url, 'capterra'),
   scrapeG2Url: url => scrapeUrl(url, 'g2'),
+  scrapeG2ServiceUrl: url => scrapeUrl(url, 'g2service'),
   scrapeSoftwareReviewsUrl: url => scrapeUrl(url, 'softwarereviews'),
   // exported for unit testing
   extractNameFromUrl,
