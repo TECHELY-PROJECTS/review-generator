@@ -3,25 +3,23 @@ const cheerio = require('cheerio');
 
 // Multi-strategy scraper (no headless browser).
 //
-// Product name: always resolved from the URL (Strategy 0), which is 100% reliable
-//   for Capterra, G2, and SoftwareReviews — even when the page itself is blocked.
+// Product name: resolved primarily from the URL (Strategy 0) using a robust
+//   parser that handles all known Capterra/G2/SoftwareReviews URL shapes —
+//   including locale prefixes (/in/, /uk/, /es/...), category prefixes,
+//   sem-compare links, and trailing path segments. We never return a numeric
+//   ID as a product name.
 //
 // Keywords: best-effort via three strategies:
-//   1. Jina Reader proxy (r.jina.ai) — free, handles JS. Works for SoftwareReviews.
-//      Blocked by Cloudflare on Capterra / G2.
+//   1. Jina Reader proxy (r.jina.ai) — works for SoftwareReviews; usually
+//      blocked by Cloudflare on Capterra / G2.
 //   2. Direct HTTP + cheerio — meta tags, JSON-LD, platform selectors.
 //      Also blocked on Capterra / G2.
-//   3. Platform-standard review topics — the actual rating dimensions each platform
-//      shows in its review form ("Consider covering…"). These are the same topics a
-//      real Capterra/G2 review covers, so they guide the AI just as well as scraped
-//      page keywords would.
-//
-// AI review generation is unaffected in every case — the prompt already has sensible
-// defaults when keywords are empty, but these platform-standard topics are much richer.
+//   3. Platform-standard review topics — generic last-resort. The response
+//      flags this case via `usedFallbackKeywords: true` so the client can
+//      upgrade these to product-specific topics using the AI model the user
+//      already has configured.
 
-// ─── Platform-standard review topics ─────────────────────────────────────────
-// These match the actual criteria/prompts each platform uses in its review form.
-
+// ─── Platform-standard review topics (generic last-resort) ───────────────────
 const PLATFORM_DEFAULT_KEYWORDS = {
   capterra: [
     'Ease of Use',
@@ -61,48 +59,109 @@ const PLATFORM_DEFAULT_KEYWORDS = {
   ],
 };
 
-// ─── Strategy 0: URL-based product name ──────────────────────────────────────
+// ─── Strategy 0: URL-based product name (robust) ─────────────────────────────
+
+// Path segments that are NEVER a product name on these review sites.
+// We skip them while looking for the real product slug.
+const STRUCTURAL_SEGMENTS = new Set([
+  // platform routing words
+  'p', 'software', 'reviews', 'review', 'products', 'product', 'app', 'apps',
+  'compare', 'comparison', 'alternatives', 'pricing', 'features', 'demo',
+  'profile', 'vendor', 'vendors', 'category', 'categories', 'directory',
+  'sem-compare', 'sem', 'shortlist', 'integrations', 'about', 'company',
+  // common locale / region prefixes
+  'in', 'uk', 'us', 'ca', 'au', 'nz', 'ie', 'es', 'de', 'fr', 'it', 'pt',
+  'br', 'mx', 'jp', 'kr', 'cn', 'tw', 'hk', 'sg', 'my', 'th', 'id', 'ph',
+  'ru', 'pl', 'tr', 'nl', 'be', 'se', 'no', 'dk', 'fi', 'gr', 'cz', 'hu',
+  'ro', 'za', 'ar', 'cl', 'co', 'pe', 've', 'en', 'en-us', 'en-gb', 'en-in',
+  'en-au', 'en-ca', 'es-es', 'es-mx', 'fr-fr', 'fr-ca', 'pt-br', 'de-de',
+]);
+
+function isNumericId(seg) {
+  // Pure numeric or numeric-with-light-decoration like "100299", "100-299"
+  if (!seg) return true;
+  return /^[0-9]+$/.test(seg) || /^[0-9]+[-_][0-9]+$/.test(seg);
+}
+
+function isLikelyProductSlug(seg) {
+  if (!seg) return false;
+  if (isNumericId(seg)) return false;
+  const lc = seg.toLowerCase();
+  if (STRUCTURAL_SEGMENTS.has(lc)) return false;
+  // Slugs are usually 2+ chars and contain at least one letter
+  if (seg.length < 2) return false;
+  if (!/[a-zA-Z]/.test(seg)) return false;
+  return true;
+}
+
+function slugToTitle(slug) {
+  if (!slug) return '';
+  // Decode URL-encoding just in case (e.g. %20)
+  let s;
+  try { s = decodeURIComponent(slug); } catch (_) { s = slug; }
+
+  // Strip a leading numeric id glued to the slug, e.g. "100299-quickbooks-online"
+  // → "quickbooks-online". Only strip if the rest still looks like a real slug.
+  const idStripped = s.replace(/^[0-9]+[-_]+/, '');
+  if (idStripped !== s && /[a-zA-Z]/.test(idStripped)) s = idStripped;
+
+  // Preserve domain-style brands like "monday.com", "notion.so"
+  if (/\.[a-zA-Z]{2,}$/.test(s)) {
+    return s.replace(/[-_]/g, ' ');
+  }
+
+  return s
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ')
+    .trim();
+}
+
+// Anchor keywords: when present in the URL, the product slug comes AFTER them.
+// e.g. /sem-compare/it-management/p/100299/QuickBooks-Online → product is after "p"
+const ANCHOR_KEYWORDS = new Set(['p', 'software', 'reviews', 'review', 'products', 'product']);
 
 /**
- * Extract the product name directly from the URL path.
- * Works 100% of the time for well-formed Capterra, G2, and SoftwareReviews links.
+ * Extract the product name from the URL.
+ *
+ * Two-pass algorithm:
+ *   1. If the URL contains an "anchor" keyword (p/software/reviews/products),
+ *      look at the segments AFTER it and return the first non-numeric, non-
+ *      structural one. This correctly handles category-prefixed URLs like
+ *      /sem-compare/it-management/p/100299/QuickBooks-Online/.
+ *   2. Otherwise fall back to "first non-numeric, non-structural segment in
+ *      the whole path", which handles SoftwareReviews-style /products/notion
+ *      and a few odd shapes.
+ *
+ * In all cases we never return a numeric ID or a known locale/structural word.
  */
-function extractNameFromUrl(rawUrl, platform) {
+function extractNameFromUrl(rawUrl /*, platform */) {
   try {
     const u = new URL(rawUrl);
     const parts = u.pathname.split('/').filter(Boolean);
+    if (!parts.length) return '';
 
-    let slug = '';
-
-    if (platform === 'capterra') {
-      // /p/ID/Product-Name[/...]  or  /software/ID/Product-Name[/...]
-      // slug is always the 3rd segment (index 2)
-      slug = parts[2] || '';
-    } else if (platform === 'g2') {
-      // /products/product-slug/reviews[/...]
-      const idx = parts.indexOf('products');
-      if (idx !== -1 && parts[idx + 1]) slug = parts[idx + 1];
-    } else if (platform === 'softwarereviews' || platform === 'software_reviews') {
-      // /products/product-slug[/reviews/...]  or just /product-slug at last segment
-      const idx = parts.indexOf('products');
-      if (idx !== -1 && parts[idx + 1]) slug = parts[idx + 1];
-      else slug = parts[parts.length - 1] || '';
+    // Pass 1: find the LAST anchor in the path, then take the first valid
+    // segment that follows it. Using the last anchor matters for URLs like
+    // /reviews/100299/Name (anchor at index 0) and /sem-compare/.../p/.../Name
+    // (anchor deeper in the path).
+    let lastAnchorIdx = -1;
+    for (let i = 0; i < parts.length; i++) {
+      if (ANCHOR_KEYWORDS.has(parts[i].toLowerCase())) lastAnchorIdx = i;
+    }
+    if (lastAnchorIdx !== -1) {
+      for (let j = lastAnchorIdx + 1; j < parts.length; j++) {
+        if (isLikelyProductSlug(parts[j])) return slugToTitle(parts[j]);
+      }
     }
 
-    if (!slug) return '';
-
-    // Convert "microsoft-teams" → "Microsoft Teams"
-    // Handle edge cases like "monday.com" (preserve lowercase brand)
-    const hasDotCom = /\.\w+$/.test(slug);
-    if (hasDotCom) {
-      // Preserve as-is for domains like "monday.com"
-      return slug.replace(/-/g, ' ');
+    // Pass 2: walk from left to right, return the first segment that looks
+    // like a slug.
+    for (const seg of parts) {
+      if (isLikelyProductSlug(seg)) return slugToTitle(seg);
     }
-    return slug
-      .split('-')
-      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(' ')
-      .trim();
+    return '';
   } catch (_) {
     return '';
   }
@@ -134,6 +193,9 @@ function cleanProductName(raw, platform) {
     name = name.replace(/\s*\|?\s*SoftwareReviews\s*$/i, '').trim();
   }
 
+  // Defensive: if cleaning leaves us with only digits, treat as empty.
+  if (/^[0-9]+$/.test(name)) return '';
+
   return name;
 }
 
@@ -146,7 +208,6 @@ function isBlockedResponse(text) {
 }
 
 function isNavJunk(text) {
-  // Reject items that are navigation/footer links, not real topics
   if (/https?:/i.test(text)) return true;
   if (/\(https?:/i.test(text)) return true;
   if (/^(Write a Review|Compare|About Us|For Vendors|More|Sign In|Sign Up|Log In|Help|Privacy|Terms|Cookie)/i.test(text))
@@ -307,10 +368,19 @@ function parseHtml(html, platform, knownName) {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * scrapeUrl(url, platform)
+ * Returns: { productName, keywords, usedFallbackKeywords }
+ *
+ * `usedFallbackKeywords: true` means we couldn't extract real product topics
+ * from the page (Capterra/G2 are usually Cloudflare-blocked) and the keywords
+ * are the platform's generic review-form criteria. The client should call
+ * /api/generate-keywords to upgrade these to product-specific topics using AI.
+ */
 async function scrapeUrl(url, platform = 'capterra') {
   const norm = (platform || 'capterra').toLowerCase();
 
-  // Strategy 0: extract product name from URL — always reliable
+  // Strategy 0: extract product name from URL — robust to all known shapes
   const urlName = extractNameFromUrl(url, norm);
 
   // Strategy 1: Jina Reader (works for SoftwareReviews; blocked on Capterra/G2)
@@ -318,11 +388,13 @@ async function scrapeUrl(url, platform = 'capterra') {
     const md = await fetchViaJina(url);
     if (md) {
       const { productName, keywords } = parseJinaMarkdown(md, norm, urlName);
-      // If we got real scraped keywords, return them
       if (keywords.length >= 3) {
-        return { productName: productName || urlName || 'Unknown Product', keywords };
+        return {
+          productName: productName || urlName || '',
+          keywords,
+          usedFallbackKeywords: false,
+        };
       }
-      // Even with no keywords, we have a name — continue to try next strategy for keywords
     }
   } catch (err) {
     console.error('[scrape] Jina failed:', err.message);
@@ -334,19 +406,24 @@ async function scrapeUrl(url, platform = 'capterra') {
     if (html) {
       const { productName, keywords } = parseHtml(html, norm, urlName);
       if (keywords.length >= 3) {
-        return { productName: productName || urlName || 'Unknown Product', keywords };
+        return {
+          productName: productName || urlName || '',
+          keywords,
+          usedFallbackKeywords: false,
+        };
       }
     }
   } catch (err) {
     console.error('[scrape] direct fetch failed:', err.message);
   }
 
-  // Strategy 3: Guaranteed fallback — name from URL + platform-standard review topics.
-  // These match the actual criteria Capterra/G2/SoftwareReviews use in their review forms.
+  // Strategy 3: Guaranteed fallback — name from URL + platform-standard topics.
+  // Caller should upgrade keywords via /api/generate-keywords.
   const defaultKeywords = PLATFORM_DEFAULT_KEYWORDS[norm] || PLATFORM_DEFAULT_KEYWORDS.capterra;
   return {
-    productName: urlName || 'Unknown Product',
+    productName: urlName || '',
     keywords: defaultKeywords,
+    usedFallbackKeywords: true,
   };
 }
 
@@ -355,4 +432,7 @@ module.exports = {
   scrapeCapterraUrl: url => scrapeUrl(url, 'capterra'),
   scrapeG2Url: url => scrapeUrl(url, 'g2'),
   scrapeSoftwareReviewsUrl: url => scrapeUrl(url, 'softwarereviews'),
+  // exported for unit testing
+  extractNameFromUrl,
+  slugToTitle,
 };

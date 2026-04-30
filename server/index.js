@@ -6,7 +6,7 @@ const path = require('path');
 
 const { scrapeUrl } = require('./scraper');
 const { buildReviewPrompt } = require('./prompt');
-const { generateReview, RECOMMENDED_MODELS } = require('./openrouter');
+const { generateReview, generateProductKeywords, RECOMMENDED_MODELS } = require('./openrouter');
 const { parseXlsx, parsePastedLine } = require('./xlsxParser');
 
 const app = express();
@@ -22,6 +22,9 @@ app.use(express.static(clientDist));
 app.get('/api/models', (_req, res) => res.json(RECOMMENDED_MODELS));
 
 // ── Scrape (platform-aware) ───────────────────────────────────────────────────
+// Returns { productName, keywords, usedFallbackKeywords } where
+// `usedFallbackKeywords: true` signals the client to upgrade keywords via
+// /api/generate-keywords (which calls the user's own LLM).
 app.post('/api/scrape', async (req, res) => {
   const { url, platform = 'capterra' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
@@ -42,7 +45,9 @@ app.post('/api/scrape-batch', async (req, res) => {
 
   const results = await Promise.allSettled(
     items.map(async item => {
-      if (!item.url || !item.url.trim()) return { index: item.index, productName: '', keywords: [] };
+      if (!item.url || !item.url.trim()) {
+        return { index: item.index, productName: '', keywords: [], usedFallbackKeywords: false };
+      }
       const data = await scrapeUrl(item.url.trim(), platform);
       return { index: item.index, ...data };
     }),
@@ -52,9 +57,33 @@ app.post('/api/scrape-batch', async (req, res) => {
     results.map((r, i) =>
       r.status === 'fulfilled'
         ? r.value
-        : { index: items[i].index, productName: '', keywords: [], error: r.reason?.message },
+        : {
+            index: items[i].index,
+            productName: '',
+            keywords: [],
+            usedFallbackKeywords: false,
+            error: r.reason?.message,
+          },
     ),
   );
+});
+
+// ── AI-generated, product-specific keywords ──────────────────────────────────
+// Called by the client when /api/scrape returns usedFallbackKeywords: true.
+// Uses the user's own OpenRouter key — never stored on the server.
+app.post('/api/generate-keywords', async (req, res) => {
+  const { apiKey, model, productName, platform = 'capterra' } = req.body;
+  if (!apiKey) return res.status(400).json({ error: 'OpenRouter API key required' });
+  if (!model) return res.status(400).json({ error: 'Model required' });
+  if (!productName) return res.status(400).json({ error: 'Product name required' });
+
+  try {
+    const keywords = await generateProductKeywords(apiKey, model, productName, platform);
+    res.json({ keywords });
+  } catch (err) {
+    console.error('Keyword AI error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Parse XLSX ────────────────────────────────────────────────────────────────

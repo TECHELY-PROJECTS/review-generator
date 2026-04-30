@@ -167,6 +167,26 @@ export default function App() {
   const removeProductRow = id =>
     setProducts(prev => prev.length > 1 ? prev.filter(p => p.id !== id) : prev)
 
+  // Upgrade generic platform fallback keywords into product-specific topics
+  // using the user's own OpenRouter key. No-op if we don't have a key/model.
+  const upgradeKeywordsWithAI = async (id, productName, platform) => {
+    if (!apiKey || !activeModel || !productName) return
+    updateProduct(id, { keywordsUpgrading: true })
+    try {
+      const r = await axios.post(`${API}/api/generate-keywords`, {
+        apiKey,
+        model: activeModel,
+        productName,
+        platform,
+      })
+      if (Array.isArray(r.data?.keywords) && r.data.keywords.length >= 3) {
+        updateProduct(id, { keywords: r.data.keywords, keywordsUpgrading: false })
+        return
+      }
+    } catch (_) { /* keep the fallback keywords on failure */ }
+    updateProduct(id, { keywordsUpgrading: false })
+  }
+
   // Scrape a single product row
   const handleScrapeRow = async (id) => {
     const row = products.find(p => p.id === id)
@@ -181,6 +201,9 @@ export default function App() {
         scraped: true,
         scrapeError: '',
       })
+      if (r.data.usedFallbackKeywords && r.data.productName) {
+        upgradeKeywordsWithAI(id, r.data.productName, row.platform)
+      }
     } catch (err) {
       updateProduct(id, {
         scraping: false,
@@ -211,6 +234,9 @@ export default function App() {
             scraped: true,
             scrapeError: '',
           })
+          if (r.data.usedFallbackKeywords && r.data.productName) {
+            upgradeKeywordsWithAI(item.id, r.data.productName, item.platform)
+          }
         } catch (err) {
           updateProduct(item.id, {
             scraping: false,
@@ -564,7 +590,10 @@ function ProductRow({ prod, idx, onUpdate, onScrape, onRemove, showRemove }) {
           </div>
           {prod.keywords.length > 0 && (
             <div className="keywords-row">
-              <span className="tag accent">Topics</span>
+              <span className="tag accent">
+                Topics
+                {prod.keywordsUpgrading && <span className="hint" style={{ marginLeft: 6 }}>(refining with AI…)</span>}
+              </span>
               <div className="keyword-chips">
                 {prod.keywords.map((k, i) => <span key={i} className="chip">{k}</span>)}
               </div>
